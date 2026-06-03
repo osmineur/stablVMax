@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Liste blanche : on N'IGNORE PAS seulement le code (.py et .ipynb).
+# Tout le reste (résultats, données, .onnx, .mcd, .csv, .pdf, .png, .dylib…) est ignoré.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1) Tout ignorer par défaut
+*
+
+# 2) Ré-autoriser la traversée des dossiers (sinon git ne descend pas dedans)
+!*/
+
+# 3) Ré-autoriser uniquement le code
+!*.py
+!*.ipynb
+!.gitignore
+
+# 4) Ré-ignorer les dossiers qui contiennent des .py de librairies / caches
+#    (un dossier exclu ici empêche de ré-inclure les .py qu'il contient)
+.venv/
+**/.venv/
+venv/
+env/
+ENV/
+**/site-packages/
+__pycache__/
+**/__pycache__/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+.DS_Store
+.idea/
+.claude/
+
+# Fichiers iCloud dechargees (dataless, illisibles tant que non re-telecharges via Finder)
+PythonIMC/Scripts/01 Export datalayers with polarity.ipynb
+PythonIMC/Scripts/00 Workflow copy.ipynb
