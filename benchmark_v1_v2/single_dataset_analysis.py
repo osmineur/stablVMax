@@ -309,8 +309,57 @@ ax.set_title(f"V2_constr — objectif FDP+ + frontière minimisé\n{TITLE}")
 ax.legend(loc="upper center", fontsize=9, ncol=2); ax.grid(alpha=0.3)
 fig_obj.tight_layout(); fig_obj.savefig(os.path.join(OUT, "v2constr_objective.png"), dpi=140)
 
+# ── Figure 6 : barrière ∂⁺(t*) sur le scatter réel vs knockoff (V2_constr) ─────
+# ∂⁺(t*) = {j : t* < score(j) ≤ t* + ε_WJ,j}  avec ε_WJ,j = εB,j + εB,j,ko.
+# La barrière n'est définie qu'à t* (seuil choisi par V2_constr). On trace pour
+# chaque feature sélectionnée une barre d'erreur descendante de longueur ε_WJ,j :
+# si elle franchit t*, la feature est dans la barrière (incertaine).
+mcb     = fitted["V2_constr"]
+srb     = mcb.stabl_scores_.max(axis=1)
+srkob   = mcb.stabl_scores_artificial_.max(axis=1)
+eps_wj  = mcb.eps_B_total_fw_                      # ε_WJ,j par feature
+gridb   = np.asarray(mcb.fdr_threshold_range)
+fdppb   = np.asarray(mcb.FDRs_)
+Db      = np.array([max(1, int((srb > t).sum())) for t in gridb])
+frob    = np.array([((srb > t) & (srb <= t + eps_wj)).sum() for t in gridb]) / Db
+tstarb  = gridb[int(np.argmin(fdppb + frob))]      # t* = argmin (FDP+ + frontière)
+
+selected = srb > tstarb
+boundary = selected & (srb <= tstarb + eps_wj)     # ∂⁺(t*)
+safe     = selected & ~boundary
+idx_all  = np.arange(P)
+
+fig_bd, ax = plt.subplots(figsize=(8.5, 7.5))
+# barres d'erreur ε_WJ,j (descendantes) pour les features sélectionnées
+for j in np.where(selected)[0]:
+    col = "#ff7f0e" if boundary[j] else "#2CA02C"
+    ax.plot([srkob[j], srkob[j]], [srb[j] - eps_wj[j], srb[j]], color=col, alpha=0.45, lw=1.2, zorder=2)
+# nuages de points par catégorie (nulles)
+def _scatter(mask, color, label, s=22):
+    i = np.where(mask & (idx_all >= K))[0]
+    if len(i): ax.scatter(srkob[i], srb[i], s=s, color=color, alpha=0.7, label=label, zorder=3)
+_scatter(~selected, "#CCCCCC", "non sélectionnées (nulles)", s=14)
+_scatter(safe,     "#2CA02C", "sélectionnées hors barrière (nulles)")
+_scatter(boundary, "#ff7f0e", "∂⁺(t*) — dans la barrière (nulles)", s=34)
+# vraies features en étoiles, même code couleur
+for j in range(K):
+    col = "#ff7f0e" if boundary[j] else ("#2CA02C" if selected[j] else "#CCCCCC")
+    ax.scatter(srkob[j], srb[j], s=150, marker="*", color=col,
+               edgecolor="black", lw=0.6, zorder=6)
+# repères : t* et la diagonale
+lim = max(srb.max(), srkob.max()) + 0.04
+ax.axhline(tstarb, color="#1f77b4", ls="--", lw=1.6, label=f"t* = {tstarb:.2f}")
+ax.plot([0, lim], [0, lim], ls=":", color="gray", lw=1, label="score = score_ko")
+n_bd = int(boundary.sum())
+ax.set_xlabel("score knockoff (score_ko)"); ax.set_ylabel("score réel (score)")
+ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+ax.set_title(f"Barrière ∂⁺(t*) de V2_constr — |∂⁺(t*)|={n_bd}, ★=vraies\n"
+             f"barre verticale = ε_WJ,j (= εB,j+εB,j,ko) — {TITLE}", fontsize=10)
+ax.legend(fontsize=8, loc="lower right")
+fig_bd.tight_layout(); fig_bd.savefig(os.path.join(OUT, "barriere_dplus.png"), dpi=140)
+
 # ── PDF combiné ───────────────────────────────────────────────────────────────
-pages = (fig_table, fig_prf, fig_roc, fig_scores, fig_bar, fig_curves, fig_obj)
+pages = (fig_table, fig_prf, fig_roc, fig_scores, fig_bar, fig_curves, fig_obj, fig_bd)
 with PdfPages(os.path.join(OUT, "analyse_complete.pdf")) as pdf:
     for f in pages:
         pdf.savefig(f)
