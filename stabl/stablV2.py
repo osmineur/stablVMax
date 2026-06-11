@@ -1102,7 +1102,8 @@ class Stabl(SelectorMixin, BaseEstimator):
             delta=0.05,
             selection_mode="unconstrained",
             cov_matrix=None,
-            knockoff_method='sdp'
+            knockoff_method='sdp',
+            alpha=1.0
     ):
         if fdr_threshold_range is None:
             fdr_threshold_range = np.arange(0., 1., .01)
@@ -1133,6 +1134,9 @@ class Stabl(SelectorMixin, BaseEstimator):
         self.selection_mode = selection_mode
         self.cov_matrix = cov_matrix
         self.knockoff_method = knockoff_method
+        # Offset du numérateur de FDP+ : num = (1/r)|S_ko(t)| + alpha.
+        # alpha=1.0 -> +1 standard (Barber-Candès) ; alpha<1 dégonfle l'offset.
+        self.alpha = alpha
         self.noise_group = np.array([])
         self.stabl_scores_ = None
         self.stabl_scores_artificial_ = None
@@ -1145,6 +1149,7 @@ class Stabl(SelectorMixin, BaseEstimator):
         # Variance tracking (V2 stability validation)
         self.score_variance_    = None  # (p, K_lambda) — real features
         self.ko_score_variance_ = None  # (n_injected_noise, K_lambda) — knockoff features
+        self.wj_mask_           = None  # (p,) bool — S₁ = {W_j > εWJ,j} (mode wj_constrained)
 
     def _validate_data(self, X=None, y=None, **kwargs):
         try:
@@ -1665,11 +1670,26 @@ class Stabl(SelectorMixin, BaseEstimator):
 
         new_threshold = self.hard_threshold if new_hard_threshold is None else new_hard_threshold
 
-        # WJ mode: S₁ = {j : W_j > εWJ,j}, FDP(S₁) = 0 with probability ≥ 1-δ
+        # WJ mode: S = {j : |W_j| > εWJ,j} — deux côtés (W_j > εWJ,j OU W_j < −εWJ,j)
         if (new_threshold is None
                 and self.selection_mode == "wj"
                 and getattr(self, 'w_paired_', None) is not None):
-            return self.w_paired_ > self.eps_paired_
+            return np.abs(self.w_paired_) > self.eps_paired_
+
+        # constrained_core mode: Ŝ = {j : score(j) > t* + εWJ,j} (barrière ∂+(t*) retirée).
+        # Même t* que "constrained" ; le cutoff feature-wise écarte le cœur incertain.
+        if (new_threshold is None
+                and self.selection_mode == "constrained_core"
+                and getattr(self, 'eps_B_total_fw_', None) is not None):
+            max_scores = np.max(self.stabl_scores_, axis=1)
+            return max_scores > self.fdr_min_threshold_ + self.eps_B_total_fw_
+
+        # wj_constrained mode: Ŝ = {j ∈ S₁ : score(j) > t*} (WJ pré-filtre + seuil sur S₁).
+        if (new_threshold is None
+                and self.selection_mode == "wj_constrained"
+                and getattr(self, 'wj_mask_', None) is not None):
+            max_scores = np.max(self.stabl_scores_, axis=1)
+            return self.wj_mask_ & (max_scores > self.fdr_min_threshold_)
 
         if new_threshold is None:
             final_cutoff = self.fdr_min_threshold_
@@ -1698,8 +1718,17 @@ class Stabl(SelectorMixin, BaseEstimator):
         "unconstrained" : t* = argmin FDP+(t) — no frontier, no Wj.
         "constrained"   : t* = argmin [FDP+(t) + |∂+(t)|/D(t)] — Maurer-Pontil
                           feature-wise frontier term, no Wj filter.
-        "wj"            : S₁ = {j : W_j > εWJ,j} — FDP(S₁) = 0 w.p. ≥ 1-δ.
+                          Selection S = {j : score(j) > t*} (garde la barrière ∂+(t*)).
+        "constrained_core" : t*_c = argmin FDP+_c(t), FDP+_c(t)=((1/r)|S_ko(t)|+1)/|S_c(t)|
+                          avec S_c(t)={j:score(j)>t+εWJ,j} ; retourne Ŝ = S_c(t*_c).
+                          Definition COHERENTE : on minimise la borne de l'ensemble
+                          RETOURNE (pas de vidage post-hoc). Sur Ω, FDP(Ŝ) ≤ FDP+_c(t*_c)
+                          sans terme frontiere (le +1 = correction conservatrice standard).
+        "wj"            : S = {j : |W_j| > εWJ,j} (deux côtés : W_j > εWJ,j OU W_j < −εWJ,j).
                           t* = argmin FDP+(t) stored for FDR curve visualization only.
+        "wj_constrained": S₁ = {j : W_j > εWJ,j}, puis Thm 7 RESTREINT à S₁ :
+                          t* = argmin_t [FDP+_restr(t) + |∂+_restr(t)|/D_restr(t)] (tout sur S₁),
+                          Ŝ = {j∈S₁ : score(j)>t*}. Garde FDP=0 de WJ, bornes plus tight.
 
         In all modes, ∂+(t) = {j : t < score(j) ≤ t + εB,j + εB,j,ko} with Maurer-Pontil
         feature-wise tolerances. εWJ,j = εB,j + εB,j,ko.
@@ -1723,9 +1752,32 @@ class Stabl(SelectorMixin, BaseEstimator):
         n_thresh              = len(thresh_grid)
 
         # ── Empirical FDP+(t) ────────────────────────────────────────────────
+        # num = (1/r)|S_ko(t)| + alpha(t). alpha=1 -> offset Barber-Candès standard.
+        # alpha peut être :
+        #   - un float                    -> offset constant
+        #   - une fonction t -> alpha      -> offset variable en t
+        #   - une fonction (t, D) -> alpha -> offset dépendant aussi de D(t)=#{score>t}.
+        #     Ex. alpha(t,D)=t^gamma·D : la contribution à FDP+ vaut alpha/D = t^gamma,
+        #     pénalité déterministe croissante indépendante de D (ne s'annule pas en queue).
+        D_for_alpha = np.array([max(1, int(np.sum(max_scores > t))) for t in thresh_grid])
+        if callable(self.alpha):
+            import inspect
+            try:
+                nparams = len(inspect.signature(self.alpha).parameters)
+            except (ValueError, TypeError):
+                nparams = 1
+            if nparams >= 2:
+                alpha_arr = np.asarray([float(self.alpha(thresh_grid[i], D_for_alpha[i]))
+                                        for i in range(n_thresh)])
+            else:
+                alpha_arr = np.asarray([float(self.alpha(t)) for t in thresh_grid])
+        else:
+            alpha_arr = np.full(n_thresh, float(self.alpha))
+        self.alpha_arr_ = alpha_arr      # exposé pour visualisation / debug
+
         FDPs = []
-        for thresh in thresh_grid:
-            num   = np.sum((1 / artificial_proportion) * (max_scores_artificial > thresh)) + 1
+        for i, thresh in enumerate(thresh_grid):
+            num   = np.sum((1 / artificial_proportion) * (max_scores_artificial > thresh)) + alpha_arr[i]
             denum = max(1, int(np.sum(max_scores > thresh)))
             FDPs.append(num / denum)
         FDPs = np.array(FDPs)
@@ -1735,7 +1787,7 @@ class Stabl(SelectorMixin, BaseEstimator):
             ms_art = self.stabl_scores_artificial_[:, i]
             ms     = self.stabl_scores_[:, i]
             for j, thresh in enumerate(thresh_grid):
-                num   = np.sum((1 / artificial_proportion) * (ms_art > thresh)) + 1
+                num   = np.sum((1 / artificial_proportion) * (ms_art > thresh)) + alpha_arr[j]
                 denum = max(1, int(np.sum(ms > thresh)))
                 fdrs_table[i, j] = num / denum
 
@@ -1788,6 +1840,7 @@ class Stabl(SelectorMixin, BaseEstimator):
             self.min_margin_fw_         = None
 
         # ── Mode: constrained — t* = argmin [FDP+(t) + |∂+(t)|/D(t)] ────────
+        # S = {score > t*} (garde la barrière ∂+(t*)).
         elif self.selection_mode == "constrained":
             D_t_arr  = np.array([max(1, int(np.sum(max_scores > t))) for t in thresh_grid])
             bdry_arr = np.array([
@@ -1801,6 +1854,68 @@ class Stabl(SelectorMixin, BaseEstimator):
             self.eps_paired_            = None
             t_star   = thresh_grid[best_idx]
             sel_mask = max_scores > t_star
+            self.min_margin_fw_ = float(
+                np.min(max_scores[sel_mask] - t_star - eps_tot_j[sel_mask])
+            ) if sel_mask.any() else 0.0
+
+        # ── Mode: constrained_core — t*_c = argmin FDP+_c(t), Ŝ = {score > t*_c + εWJ,j} ──
+        # FDP+_c(t) = ((1/r)|S_ko(t)| + 1) / max(1,|S_c(t)|),  S_c(t) = {score > t + εWJ,j}.
+        # Inclusion S_c∩M0 ⊆ S_ko(t) => |S_c∩M0| ≤ |S_ko(t)| : PAS de terme frontière.
+        # Le +1 est la correction conservatrice standard (façon knockoff/BH). On minimise
+        # la borne de l'ensemble RETOURNÉ => définition cohérente, pas de vidage post-hoc.
+        elif self.selection_mode == "constrained_core":
+            n_ko_arr = np.array([
+                np.sum((1 / artificial_proportion) * (max_scores_artificial > t))
+                for t in thresh_grid
+            ])
+            Dc_arr   = np.array([
+                max(1, int(np.sum(max_scores > t + eps_tot_j))) for t in thresh_grid
+            ])
+            obj      = (n_ko_arr + 1) / Dc_arr      # FDP+_c(t) = ((1/r)|S_ko(t)| + 1) / |S_c(t)|
+            best_idx                    = int(np.where(obj == obj.min())[0][0])
+            self.constrained_threshold_ = True
+            self.w_paired_              = None
+            self.eps_paired_            = None
+            t_star   = thresh_grid[best_idx]
+            sel_mask = max_scores > t_star + eps_tot_j
+            self.min_margin_fw_ = float(
+                np.min(max_scores[sel_mask] - t_star - eps_tot_j[sel_mask])
+            ) if sel_mask.any() else 0.0
+
+        # ── Mode: wj_constrained — S₁={W_j>εWJ,j}, puis V2_constr RESTREINT à S₁ ──
+        # Theorem 7 appliqué à S₁ : t* = argmin_t [FDP+_restr(t) + |∂+_restr(t)|/D_restr(t)],
+        # tout compté sur S₁ (numérateur knockoff inclus). Ŝ = {j∈S₁ : score(j)>t*}.
+        # Sur Ω, S₁ n'a aucune nulle (garantie WJ, FDP=0) ; et la borne est plus tight car
+        # knockoffs, frontière et nulles sont tous réduits sur S₁. Preuve identique à Thm 7.
+        elif self.selection_mode == "wj_constrained":
+            paired_ok = (
+                self.ko_score_variance_ is not None
+                and self.stabl_scores_artificial_.shape[0] == p
+                and self.ko_score_variance_.shape[0] == p
+            )
+            if paired_ok:
+                wj_mask = (max_scores - max_scores_artificial) > eps_tot_j     # S₁
+            else:
+                wj_mask = np.ones(p, dtype=bool)        # fallback = constrained sur tout
+            self.wj_mask_ = wj_mask
+            ms      = max_scores[wj_mask]               # scores réels restreints à S₁
+            ms_art  = max_scores_artificial[wj_mask]    # scores knockoffs restreints à S₁
+            eps_s1  = eps_tot_j[wj_mask]
+            D_t_arr  = np.array([max(1, int(np.sum(ms > t))) for t in thresh_grid])
+            n_ko_arr = np.array([
+                np.sum((1 / artificial_proportion) * (ms_art > t)) for t in thresh_grid
+            ])
+            bdry_arr = np.array([
+                np.sum((ms > t) & (ms <= t + eps_s1)) / D_t_arr[i]
+                for i, t in enumerate(thresh_grid)
+            ])
+            obj      = (n_ko_arr + 1) / D_t_arr + bdry_arr   # FDP+_restr + frontière_restr
+            best_idx                    = int(np.where(obj == obj.min())[0][0])
+            self.constrained_threshold_ = True
+            self.w_paired_              = None
+            self.eps_paired_            = None
+            t_star   = thresh_grid[best_idx]
+            sel_mask = wj_mask & (max_scores > t_star)
             self.min_margin_fw_ = float(
                 np.min(max_scores[sel_mask] - t_star - eps_tot_j[sel_mask])
             ) if sel_mask.any() else 0.0
@@ -1830,7 +1945,8 @@ class Stabl(SelectorMixin, BaseEstimator):
 
         else:
             raise ValueError(
-                f"selection_mode must be 'unconstrained', 'constrained', or 'wj'; "
+                f"selection_mode must be 'unconstrained', 'constrained', "
+                f"'constrained_core', 'wj_constrained', or 'wj'; "
                 f"got '{self.selection_mode}'"
             )
 

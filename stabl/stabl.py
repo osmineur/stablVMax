@@ -1082,7 +1082,8 @@ class Stabl(SelectorMixin, BaseEstimator):
             xgb_importance_type="weight",
             verbose=0,
             n_jobs=-1,
-            random_state=None
+            random_state=None,
+            cov_matrix=None
     ):
         if fdr_threshold_range is None:
             fdr_threshold_range = np.arange(0., 1., .01)
@@ -1108,6 +1109,7 @@ class Stabl(SelectorMixin, BaseEstimator):
         self.n_jobs = n_jobs
         self.replace = replace
         self.random_state = random_state
+        self.cov_matrix = cov_matrix
         self.perc_corr_group_threshold = perc_corr_group_threshold
         self.sgl_groups = sgl_groups
         self.noise_group = np.array([])
@@ -1614,12 +1616,17 @@ class Stabl(SelectorMixin, BaseEstimator):
                 for i in range(X.shape[1]//3000 + 1):
                     cols = rng.choice(a=X.shape[1], size=3000, replace=False)
                     X_tmp = X[:, cols]
-                    X_art_tmp = GaussianSampler(X_tmp, method='equicorrelated').sample_knockoffs()
+                    # Si un Sigma exact est fourni, on en extrait le sous-bloc des colonnes
+                    # tirées ; sinon GaussianSampler l'estime depuis X_tmp (comportement V1 d'origine).
+                    Sigma_tmp = self.cov_matrix[np.ix_(cols, cols)] if self.cov_matrix is not None else None
+                    X_art_tmp = GaussianSampler(X_tmp, Sigma=Sigma_tmp, method='equicorrelated').sample_knockoffs()
                     X_artificial[:, i*3000: (i+1)*3000] = X_art_tmp
                 X_artificial = X_artificial[:, rng.choice(a=X_artificial.shape[1], size=X.shape[1], replace=False)]
 
             else:
-                X_artificial = GaussianSampler(X, method='equicorrelated').sample_knockoffs()
+                # cov_matrix=None (defaut) => Sigma estime en interne (V1 d'origine) ;
+                # cov_matrix=Sigma_exact => knockoffs construits avec le vrai Sigma.
+                X_artificial = GaussianSampler(X, Sigma=self.cov_matrix, method='equicorrelated').sample_knockoffs()
 
             indices = rng.choice(a=X_artificial.shape[1], size=nb_noise, replace=False)
             self.noise_group = indices
