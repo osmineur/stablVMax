@@ -254,6 +254,7 @@ class ALogitLasso(LogisticRegression):
         self,
         n_iter_lasso=2,
         *,
+        penalty="l1",
         dual=False,
         tol=1e-4,
         C=1.0,
@@ -271,6 +272,7 @@ class ALogitLasso(LogisticRegression):
         self.coef_ = None
         self.n_iter_lasso = n_iter_lasso
         super().__init__(
+            penalty=penalty,          # adaptive LASSO -> l1 par défaut (sinon ridge: non-sparse)
             dual=dual,
             tol=tol,
             C=C,
